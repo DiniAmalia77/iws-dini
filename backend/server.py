@@ -73,6 +73,13 @@ class Permission(str):
     DELETE_METER = "delete_meter"
     VIEW_ALL_METERS = "view_all_meters"
     
+    # Property Management
+    CREATE_PROPERTY = "create_property"
+    EDIT_PROPERTY = "edit_property"
+    DELETE_PROPERTY = "delete_property"
+    VIEW_ALL_PROPERTIES = "view_all_properties"
+    VERIFY_PROPERTY = "verify_property"
+    
     # Transaction Management
     VIEW_ALL_TRANSACTIONS = "view_all_transactions"
     REFUND_TRANSACTION = "refund_transaction"
@@ -93,6 +100,8 @@ ROLE_PERMISSIONS = {
         Permission.VIEW_USERS, Permission.MANAGE_ROLES,
         Permission.CREATE_METER, Permission.EDIT_METER, Permission.DELETE_METER, 
         Permission.VIEW_ALL_METERS,
+        Permission.CREATE_PROPERTY, Permission.EDIT_PROPERTY, Permission.DELETE_PROPERTY,
+        Permission.VIEW_ALL_PROPERTIES, Permission.VERIFY_PROPERTY,
         Permission.VIEW_ALL_TRANSACTIONS, Permission.REFUND_TRANSACTION,
         Permission.MANAGE_SETTINGS, Permission.UPLOAD_LOGO, Permission.MANAGE_RATES,
         Permission.VIEW_REPORTS, Permission.EXPORT_DATA
@@ -100,6 +109,7 @@ ROLE_PERMISSIONS = {
     UserRole.ADMIN: [
         Permission.VIEW_USERS, Permission.EDIT_USER,
         Permission.VIEW_ALL_METERS, Permission.EDIT_METER,
+        Permission.VIEW_ALL_PROPERTIES, Permission.VERIFY_PROPERTY,
         Permission.VIEW_ALL_TRANSACTIONS,
         Permission.UPLOAD_LOGO, Permission.MANAGE_RATES,
         Permission.VIEW_REPORTS
@@ -107,11 +117,13 @@ ROLE_PERMISSIONS = {
     UserRole.MANAGER: [
         Permission.VIEW_USERS,
         Permission.VIEW_ALL_METERS,
+        Permission.VIEW_ALL_PROPERTIES,
         Permission.VIEW_ALL_TRANSACTIONS,
         Permission.VIEW_REPORTS
     ],
     UserRole.CUSTOMER: [
-        Permission.CREATE_METER, Permission.EDIT_METER
+        Permission.CREATE_METER, Permission.EDIT_METER,
+        Permission.CREATE_PROPERTY, Permission.EDIT_PROPERTY
     ]
 }
 
@@ -144,6 +156,50 @@ class Token(BaseModel):
     token_type: str
     user: User
 
+class PropertyType(str):
+    RESIDENTIAL = "residential"
+    COMMERCIAL = "commercial"
+    INDUSTRIAL = "industrial"
+    BOARDING_HOUSE = "boarding_house"
+    RENTAL = "rental"
+    OTHER = "other"
+
+class PropertyStatus(str):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+class Property(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    property_type: str
+    address: str
+    city: str
+    postal_code: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    owner_id: str
+    owner_name: str
+    status: str = PropertyStatus.PENDING
+    verification_note: Optional[str] = None
+    verified_by: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class PropertyCreate(BaseModel):
+    name: str
+    property_type: str
+    address: str
+    city: str
+    postal_code: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class PropertyVerify(BaseModel):
+    status: str
+    note: Optional[str] = None
+
 class WaterMeter(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -151,9 +207,14 @@ class WaterMeter(BaseModel):
     location: str
     customer_id: str
     customer_name: str
+    property_id: Optional[str] = None
+    property_name: Optional[str] = None
     balance: float = 0.0
     status: str = "active"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class MeterPropertyLink(BaseModel):
+    property_id: str
 
 class MeterCreate(BaseModel):
     meter_number: str
@@ -330,6 +391,189 @@ async def get_meter(meter_id: str, current_user: User = Depends(get_current_user
     
     return WaterMeter(**meter_data)
 
+@api_router.put("/meters/{meter_id}/property")
+async def link_meter_to_property(
+    meter_id: str,
+    link: MeterPropertyLink,
+    current_user: User = Depends(get_current_user)
+):
+    """Link meter to a property"""
+    # Check meter exists and user has access
+    meter_data = await db.meters.find_one({"id": meter_id})
+    if not meter_data:
+        raise HTTPException(status_code=404, detail="Meter not found")
+    
+    if not current_user.has_permission(Permission.EDIT_METER) and meter_data['customer_id'] != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    # Check property exists and is approved
+    property_data = await db.properties.find_one({"id": link.property_id})
+    if not property_data:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    if property_data['status'] != PropertyStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="Property must be approved first")
+    
+    # Update meter
+    await db.meters.update_one(
+        {"id": meter_id},
+        {"$set": {
+            "property_id": link.property_id,
+            "property_name": property_data['name']
+        }}
+    )
+    
+    return {"message": "Meter linked to property successfully"}
+
+# ============= PROPERTY ROUTES =============
+
+@api_router.post("/properties", response_model=Property)
+async def create_property(property_data: PropertyCreate, current_user: User = Depends(get_current_user)):
+    """Create new property"""
+    if not current_user.has_permission(Permission.CREATE_PROPERTY):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    
+    # Validate property type
+    valid_types = [PropertyType.RESIDENTIAL, PropertyType.COMMERCIAL, PropertyType.INDUSTRIAL,
+                   PropertyType.BOARDING_HOUSE, PropertyType.RENTAL, PropertyType.OTHER]
+    if property_data.property_type not in valid_types:
+        raise HTTPException(status_code=400, detail="Invalid property type")
+    
+    property_obj = Property(
+        name=property_data.name,
+        property_type=property_data.property_type,
+        address=property_data.address,
+        city=property_data.city,
+        postal_code=property_data.postal_code,
+        latitude=property_data.latitude,
+        longitude=property_data.longitude,
+        owner_id=current_user.id,
+        owner_name=current_user.name,
+        status=PropertyStatus.PENDING
+    )
+    
+    property_doc = property_obj.model_dump()
+    property_doc['created_at'] = property_doc['created_at'].isoformat()
+    
+    await db.properties.insert_one(property_doc)
+    
+    logger.info(f"Property created: {property_obj.id} by {current_user.email}")
+    
+    return property_obj
+
+@api_router.get("/properties", response_model=List[Property])
+async def get_properties(current_user: User = Depends(get_current_user)):
+    """Get properties list"""
+    if current_user.has_permission(Permission.VIEW_ALL_PROPERTIES):
+        properties = await db.properties.find({}, {"_id": 0}).to_list(1000)
+    else:
+        properties = await db.properties.find({"owner_id": current_user.id}, {"_id": 0}).to_list(1000)
+    
+    for prop in properties:
+        if isinstance(prop['created_at'], str):
+            prop['created_at'] = datetime.fromisoformat(prop['created_at'])
+        if prop.get('verified_at') and isinstance(prop['verified_at'], str):
+            prop['verified_at'] = datetime.fromisoformat(prop['verified_at'])
+    
+    return properties
+
+@api_router.get("/properties/{property_id}", response_model=Property)
+async def get_property(property_id: str, current_user: User = Depends(get_current_user)):
+    """Get property details"""
+    property_data = await db.properties.find_one({"id": property_id}, {"_id": 0})
+    if not property_data:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    if not current_user.has_permission(Permission.VIEW_ALL_PROPERTIES) and property_data['owner_id'] != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    if isinstance(property_data['created_at'], str):
+        property_data['created_at'] = datetime.fromisoformat(property_data['created_at'])
+    if property_data.get('verified_at') and isinstance(property_data['verified_at'], str):
+        property_data['verified_at'] = datetime.fromisoformat(property_data['verified_at'])
+    
+    return Property(**property_data)
+
+@api_router.put("/properties/{property_id}")
+async def update_property(
+    property_id: str,
+    property_update: PropertyCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Update property"""
+    property_data = await db.properties.find_one({"id": property_id})
+    if not property_data:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    if not current_user.has_permission(Permission.EDIT_PROPERTY) and property_data['owner_id'] != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    # If property was approved, set back to pending after edit
+    update_data = property_update.model_dump()
+    if property_data['status'] == PropertyStatus.APPROVED:
+        update_data['status'] = PropertyStatus.PENDING
+        update_data['verification_note'] = None
+        update_data['verified_by'] = None
+        update_data['verified_at'] = None
+    
+    await db.properties.update_one(
+        {"id": property_id},
+        {"$set": update_data}
+    )
+    
+    logger.info(f"Property updated: {property_id} by {current_user.email}")
+    
+    return {"message": "Property updated successfully"}
+
+@api_router.put("/properties/{property_id}/verify")
+async def verify_property(
+    property_id: str,
+    verify_data: PropertyVerify,
+    current_user: User = Depends(require_permission(Permission.VERIFY_PROPERTY))
+):
+    """Verify property (approve/reject)"""
+    property_data = await db.properties.find_one({"id": property_id})
+    if not property_data:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    if verify_data.status not in [PropertyStatus.APPROVED, PropertyStatus.REJECTED]:
+        raise HTTPException(status_code=400, detail="Status must be approved or rejected")
+    
+    await db.properties.update_one(
+        {"id": property_id},
+        {"$set": {
+            "status": verify_data.status,
+            "verification_note": verify_data.note,
+            "verified_by": current_user.email,
+            "verified_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    
+    logger.info(f"Property {property_id} {verify_data.status} by {current_user.email}")
+    
+    return {"message": f"Property {verify_data.status} successfully"}
+
+@api_router.delete("/properties/{property_id}")
+async def delete_property(
+    property_id: str,
+    current_user: User = Depends(require_permission(Permission.DELETE_PROPERTY))
+):
+    """Delete property"""
+    property_data = await db.properties.find_one({"id": property_id})
+    if not property_data:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    # Check if any meters are linked
+    linked_meters = await db.meters.count_documents({"property_id": property_id})
+    if linked_meters > 0:
+        raise HTTPException(status_code=400, detail="Cannot delete property with linked meters")
+    
+    await db.properties.delete_one({"id": property_id})
+    
+    logger.info(f"Property deleted: {property_id} by {current_user.email}")
+    
+    return {"message": "Property deleted successfully"}
+
 # ============= CREDIT & PAYMENT ROUTES =============
 
 @api_router.post("/credit/purchase")
@@ -439,7 +683,13 @@ async def admin_dashboard(current_user: User = Depends(require_permission(Permis
     total_customers = await db.users.count_documents({"role": UserRole.CUSTOMER})
     total_users = await db.users.count_documents({})
     total_meters = await db.meters.count_documents({})
+    total_properties = await db.properties.count_documents({})
     total_transactions = await db.transactions.count_documents({})
+    
+    # Property stats by status
+    pending_properties = await db.properties.count_documents({"status": PropertyStatus.PENDING})
+    approved_properties = await db.properties.count_documents({"status": PropertyStatus.APPROVED})
+    rejected_properties = await db.properties.count_documents({"status": PropertyStatus.REJECTED})
     
     # Total revenue
     transactions = await db.transactions.find({"status": {"$in": ["capture", "settlement"]}}, {"_id": 0}).to_list(10000)
@@ -455,9 +705,15 @@ async def admin_dashboard(current_user: User = Depends(require_permission(Permis
         "total_customers": total_customers,
         "total_users": total_users,
         "total_meters": total_meters,
+        "total_properties": total_properties,
         "total_transactions": total_transactions,
         "total_revenue": total_revenue,
-        "role_distribution": role_stats
+        "role_distribution": role_stats,
+        "property_stats": {
+            "pending": pending_properties,
+            "approved": approved_properties,
+            "rejected": rejected_properties
+        }
     }
 
 @api_router.get("/admin/customers")
