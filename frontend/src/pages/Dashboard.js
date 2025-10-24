@@ -7,17 +7,21 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { toast } from 'sonner';
-import { Droplets, Plus, MapPin, Activity, CreditCard, LogOut, AlertCircle, TrendingUp } from 'lucide-react';
+import { Droplets, Plus, MapPin, Activity, CreditCard, LogOut, AlertCircle, TrendingUp, Home, Link as LinkIcon } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import PropertyManagement from './PropertyManagement';
 
 const Dashboard = () => {
   const { user, logout } = useContext(AuthContext);
   const [meters, setMeters] = useState([]);
+  const [properties, setProperties] = useState([]);
   const [transactions, setTransactions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAddMeter, setShowAddMeter] = useState(false);
   const [showPurchase, setShowPurchase] = useState(false);
+  const [showLinkProperty, setShowLinkProperty] = useState(false);
   const [selectedMeter, setSelectedMeter] = useState(null);
 
   const [newMeter, setNewMeter] = useState({
@@ -38,12 +42,14 @@ const Dashboard = () => {
 
   const fetchData = async () => {
     try {
-      const [metersRes, transRes] = await Promise.all([
+      const [metersRes, transRes, propsRes] = await Promise.all([
         axios.get(`${API}/meters`),
-        axios.get(`${API}/transactions`)
+        axios.get(`${API}/transactions`),
+        axios.get(`${API}/properties`)
       ]);
       setMeters(metersRes.data);
       setTransactions(transRes.data);
+      setProperties(propsRes.data.filter(p => p.status === 'approved'));
     } catch (error) {
       toast.error('Gagal memuat data');
     } finally {
